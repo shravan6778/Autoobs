@@ -1,0 +1,346 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoobs
+---
+# RBAC for eBPF and OTel Agent to read cluster metadata
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoobs-agent
+  namespace: autoobs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: autoobs-agent-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions", "apps"]
+  resources: ["replicasets", "deployments", "daemonsets", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: autoobs-agent-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: autoobs-agent-role
+subjects:
+- kind: ServiceAccount
+  name: autoobs-agent
+  namespace: autoobs
+---
+# ConfigMaps for the Stack
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoobs-configs
+  namespace: autoobs
+data:
+  otel-agent.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+      hostmetrics:
+        collection_interval: 10s
+        scrapers:
+          cpu: {}
+          memory: {}
+          network: {}
+    exporters:
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+      loki:
+        endpoint: "http://loki.autoobs.svc.cluster.local:3100/loki/api/v1/push"
+      otlp/tempo:
+        endpoint: "tempo.autoobs.svc.cluster.local:4317"
+        tls:
+          insecure: true
+    service:
+      pipelines:
+        metrics:
+          receivers: [otlp, hostmetrics]
+          exporters: [prometheus]
+        logs:
+          receivers: [otlp]
+          exporters: [loki]
+        traces:
+          receivers: [otlp]
+          exporters: [otlp/tempo]
+---
+# Redpanda (Kafka compatible) for Streaming
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+  namespace: autoobs
+spec:
+  serviceName: redpanda
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      containers:
+      - name: redpanda
+        image: docker.redpanda.com/redpandadata/redpanda:v23.2.1
+        args:
+        - redpanda
+        - start
+        - --smp 1
+        - --memory 1G
+        - --reserve-memory 0M
+        - --overprovisioned
+        - --node-id 0
+        - --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:9093
+        - --advertise-kafka-addr PLAINTEXT://redpanda.autoobs.svc.cluster.local:9092,OUTSIDE://localhost:9093
+        ports:
+        - containerPort: 9092
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: autoobs
+spec:
+  ports:
+  - port: 9092
+    targetPort: 9092
+  selector:
+    app: redpanda
+---
+# Prometheus
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: autoobs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        ports:
+        - containerPort: 9090
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: autoobs
+spec:
+  ports:
+  - port: 9090
+    targetPort: 9090
+  selector:
+    app: prometheus
+---
+# Loki
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: autoobs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+      - name: loki
+        image: grafana/loki:2.8.2
+        ports:
+        - containerPort: 3100
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: autoobs
+spec:
+  ports:
+  - port: 3100
+    targetPort: 3100
+  selector:
+    app: loki
+---
+# Tempo
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: autoobs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tempo
+  template:
+    metadata:
+      labels:
+        app: tempo
+    spec:
+      containers:
+      - name: tempo
+        image: grafana/tempo:2.1.1
+        args: ["-config.file=/etc/tempo.yaml"]
+        ports:
+        - containerPort: 3200
+        - containerPort: 4317
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: autoobs
+spec:
+  ports:
+  - name: tempo
+    port: 3200
+    targetPort: 3200
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  selector:
+    app: tempo
+---
+# Ollama (AI Engine)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: autoobs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2Gi"
+          limits:
+            cpu: "4000m"
+            memory: "8Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: autoobs
+spec:
+  ports:
+  - port: 11434
+    targetPort: 11434
+  selector:
+    app: ollama
+---
+# OTel & eBPF Agent DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: autoobs-agent
+  namespace: autoobs
+spec:
+  selector:
+    matchLabels:
+      app: autoobs-agent
+  template:
+    metadata:
+      labels:
+        app: autoobs-agent
+    spec:
+      serviceAccountName: autoobs-agent
+      hostPID: true
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:0.82.0
+        securityContext:
+          privileged: true # Required for eBPF
+        ports:
+        - containerPort: 4317
+        - containerPort: 4318
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/otelcol-contrib/config.yaml
+          subPath: otel-agent.yaml
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+      volumes:
+      - name: config-volume
+        configMap:
+          name: autoobs-configs
+      - name: varlog
+        hostPath:
+          path: /var/log
